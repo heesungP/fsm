@@ -1,15 +1,21 @@
 import pickle
 import os
 import sys
+import time
 from src.pipeline import run_pipeline
 
 def test_reproduction():
+    start_time = time.time()
     print("Running pipeline for first 5 users...")
     try:
         run_pipeline(max_users=5)
     except Exception as e:
         print(f"Pipeline failed: {e}")
         return
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Pipeline finished in {elapsed_time:.4f} seconds.")
 
     # Check output for User 1
     output_file = 'subgraphs/1_subgraphs.pkl'
