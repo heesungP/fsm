@@ -40,6 +40,11 @@ class Triple:
         self.obj_inst = new_obj_inst
         return self
 
+    def copy(self):
+        new_triple = Triple(self.idx, self.subj_cl, self.subj_inst, self.prop, self.obj_cl, self.obj_inst)
+        new_triple.same_code = self.same_code
+        return new_triple
+
     def str_code(self):
         return '^'.join([self.subj_cl, self.subj_inst, self.prop, self.obj_cl, self.obj_inst])
 

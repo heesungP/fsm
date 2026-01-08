@@ -84,31 +84,31 @@ class FSMEngine:
 
         return result, properties
 
-    def store_triples(self, file, start_cl):
+    def store_triples(self, triples_data, start_cl):
+        """
+        Modified to accept a list of raw triple data (tuples or lists) instead of a file path.
+        triples_data: list of (triple_id, subj_cl, subj_inst, prop, obj_cl, obj_inst)
+        """
         start_instances = list()
         triple_dict = dict()
         prop_triples_dict = dict()
 
-        with open(file, 'r') as f:
-            while True:
-                line = f.readline().rstrip()
-                if not line:
-                    break
+        for row in triples_data:
+            # row is expected to be [triple_id, subj_cl, subj_inst, prop, obj_cl, obj_inst]
+            triple_id, subj_cl, subj_inst, prop, obj_cl, obj_inst = row
+            temp_triple = Triple(str(triple_id), subj_cl, subj_inst, prop, obj_cl, obj_inst)
 
-                triple_id, subj_cl, subj_inst, prop, obj_cl, obj_inst = line.split('^')
-                temp_triple = Triple(triple_id, subj_cl, subj_inst, prop, obj_cl, obj_inst)
+            if obj_cl == start_cl and obj_inst not in start_instances:
+                start_instances.append(obj_inst)
+            if subj_cl == start_cl and subj_inst not in start_instances:
+                start_instances.append(subj_inst)
 
-                if obj_cl == start_cl and obj_inst not in start_instances:
-                    start_instances.append(obj_inst)
-                if subj_cl == start_cl and subj_inst not in start_instances:
-                    start_instances.append(subj_inst)
+            triple_dict[str(triple_id)] = temp_triple
 
-                triple_dict[triple_id] = temp_triple
-
-                if prop not in prop_triples_dict.keys():
-                    prop_triples_dict[prop] = [temp_triple]
-                else:
-                    prop_triples_dict[prop].append(temp_triple)
+            if prop not in prop_triples_dict.keys():
+                prop_triples_dict[prop] = [temp_triple]
+            else:
+                prop_triples_dict[prop].append(temp_triple)
 
         log_data('start_instance_list', start_instances)
         log_data('triple_dict', triple_dict)
@@ -217,7 +217,8 @@ class FSMEngine:
         ITID_Freq_depth = self.ITID_Freq_depth
         depth_chunk = self.depth_chunk
 
-        it_hash_temp = copy.deepcopy(it_hash)
+        # Optimization: Use dictionary comprehension with Triple.copy() instead of deepcopy
+        it_hash_temp = {k: v.copy() for k, v in it_hash.items()}
 
         for tid, triple in it_hash_temp.items():
             sbj_cl = triple.subj_cl
@@ -288,8 +289,9 @@ class FSMEngine:
     def chunking(self, candidates, it_hash, itid_tr, threshold):
         self.depth_chunk += 1
         
-        it_hash_temp = copy.deepcopy(it_hash)
-        itid_tr_temp = copy.deepcopy(itid_tr)
+        # Optimization: Use shallow copies where possible
+        it_hash_temp = {k: v.copy() for k, v in it_hash.items()}
+        itid_tr_temp = itid_tr.copy()
 
         Tr_IT_hash = dict()
         for triple, transaction in itid_tr_temp.items():
