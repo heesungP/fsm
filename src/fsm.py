@@ -108,7 +108,10 @@ class FSMEngine:
         """
         start_cl_id = self.mapper.get_id(start_cl)
         
+        # Optimization: Use set for O(1) lookup, list for order
+        start_instances_set = set()
         start_instances = list()
+        
         triple_dict = dict()
         prop_triples_dict = dict()
 
@@ -124,10 +127,12 @@ class FSMEngine:
             
             temp_triple = Triple(triple_id, subj_cl, subj_inst, prop, obj_cl, obj_inst)
 
-            if obj_cl == start_cl_id and obj_inst not in start_instances:
+            if obj_cl == start_cl_id and obj_inst not in start_instances_set:
                 start_instances.append(obj_inst)
-            if subj_cl == start_cl_id and subj_inst not in start_instances:
+                start_instances_set.add(obj_inst)
+            if subj_cl == start_cl_id and subj_inst not in start_instances_set:
                 start_instances.append(subj_inst)
+                start_instances_set.add(subj_inst)
 
             triple_dict[triple_id] = temp_triple # Key is int ID
 
