@@ -6,4 +6,6 @@ training_1m/
 venv/
 fsm_run.log
 requirements.txt
-
+.DS_Store
+__pycache__/.DS_Store
+__pycache__/

@@ -6,6 +6,7 @@ from datetime import datetime
 from collections import defaultdict
 import pandas as pd
 import logging
+from joblib import Parallel, delayed, cpu_count
 
 from .config import (
     TRAINING_FOLDER, SUBGRAPHS_FOLDER, SCHEMA_FILE,
@@ -15,6 +16,216 @@ from .config import (
 from .utils import log_data
 from .fsm import FSMEngine
 from .data_loader import load_mapped_data, load_metadata_triples
+from .mapper import StringMapper
+
+def process_single_user(user_data, schema_data, combined_metadata, base_mapper_state):
+    user_id, user_series = user_data
+    original_property_dict, original_ontology_graph, original_ontology_path_list, original_path_property_set = schema_data
+    
+    # Initialize Mapper with Base State (Schema)
+    mapper = StringMapper()
+    mapper.str_to_int = base_mapper_state['str_to_int'].copy()
+    mapper.int_to_str = base_mapper_state['int_to_str'].copy()
+    mapper.counter = base_mapper_state['counter']
+
+    start_datetime = datetime.now()
+    watched_movie_len = len(user_series)
+    print(f"User: {user_id} | Number of Watching Events: {watched_movie_len}")
+
+    # Threshold Calculation
+    min_support = 0
+    if watched_movie_len > 100:
+        min_support = 4
+    elif 8 <= watched_movie_len <= 100:
+        min_support = int(math.log(watched_movie_len))
+    elif 3 <= watched_movie_len < 8:
+        min_support = 2
+    else:
+        print(f"Skipping User {user_id} (Not enough data)")
+        return
+
+    print(f'threshold: {min_support}')
+
+    target_data = user_series.iloc[:-1].copy()
+    
+    # --- Triple Generation (Vectorized & Memory-based) ---
+    total_triples = list()
+    
+    # Vectorized preparation
+    uids = target_data['userId'].astype(int).astype(str).tolist()
+    mids = target_data['tmdbId'].astype(int).astype(str).tolist()
+    
+    for uid, mid in zip(uids, mids):
+        user_node = "USER_" + uid
+        movie_node = "MOVI_" + mid
+        event_node = "U" + uid + "_M" + mid
+        
+        # Triple 1: User -> WatchingEvent
+        total_triples.append((0, "User", user_node, "UserWatching", "WatchingEvent", event_node))
+        
+        # Triple 3: WatchingEvent -> Movie
+        total_triples.append((0, "WatchingEvent", event_node, "WatchingMovie", "Movie", movie_node))
+
+    # Metadata Logic (Optimized)
+    for uid, mid in zip(uids, mids):
+        movi_key = "MOVI_" + mid
+        if movi_key in combined_metadata:
+            total_triples.extend(combined_metadata[movi_key])
+
+    # Assign Triple IDs and Format for Engine
+    triples_for_engine = []
+    triple_no = 0
+    for t in total_triples:
+        if len(t) >= 5:
+            # Row: [id, subj_cl, subj_inst, prop, obj_cl, obj_inst] (All Strings)
+            row = [str(triple_no), t[0], t[1], t[2], t[3], t[4]]
+            triples_for_engine.append(row)
+            triple_no += 1
+
+    mid_datetime = datetime.now()
+
+    # --- Run FSM for User ---
+    engine = FSMEngine(mapper)
+    
+    # Restore schema info (These contain IDs now because base_mapper_state was used in main)
+    # Need to be careful: original_property_dict keys/values must be IDs.
+    # The main process loaded schema using a mapper, so these are already IDs.
+    engine.property_dict = copy.deepcopy(original_property_dict)
+    engine.ontology_path_list = copy.deepcopy(original_ontology_path_list)
+    engine.path_property_set = copy.deepcopy(original_path_property_set)
+    # ontology_graph is not modified, can use reference? dict is mutable, safe to copy?
+    # engine.ontology_graph is modified in load_schema but not in mining?
+    # find_ontology_paths doesn't modify graph.
+    engine.ontology_graph = original_ontology_graph # Pass as is if read-only
+
+    # 3. Store Triples (Strings -> IDs inside)
+    start_instance_list, triple_dict, prop_triples_dict = engine.store_triples(triples_for_engine, START_CLASS)
+    engine.prop_triples_dict = prop_triples_dict
+
+    # Filter schema based on available data (IDs)
+    # prop_triples_dict keys are IDs.
+    # engine.property_dict values are [dom_id, prop_id, ran_id].
+    
+    prop_id_list = [property_info[1] for property_id, property_info in engine.property_dict.items()]
+    
+    # triple_dict keys are IDs. triple values have .prop (ID).
+    triple_dict = {tid: t for tid, t in triple_dict.items() if t.prop in prop_id_list}
+
+    engine.property_dict = {pid: val for pid, val in engine.property_dict.items() 
+                            if val[1] in prop_triples_dict.keys()}
+    engine.ontology_path_list = [op for op in engine.ontology_path_list 
+                                 if set(op).issubset(set(engine.property_dict.keys()))]
+    engine.path_property_set = engine.path_property_set.intersection(set(engine.property_dict.keys()))
+
+    # 4. Triple Paths
+    triple_paths_dict = {start_instance: engine.find_triple_paths(START_CLASS, start_instance)
+                         for start_instance in start_instance_list}
+    
+    transaction_triple = {start_instance: set(sum(triple_paths, [])) 
+                          for start_instance, triple_paths in triple_paths_dict.items()}
+    
+    it_trs = defaultdict(set)
+    for start_instance, triple_set in transaction_triple.items():
+        for tid in triple_set:
+            it_trs[tid].add(start_instance)
+            
+    # Filter triple_dict
+    triple_dict = {tid: t for tid, t in triple_dict.items() if tid in it_trs}
+            
+    itid_tr = {tid: list(start_instance)[0] for tid, start_instance in it_trs.items()}
+    
+    # 5. Chunk Type
+    engine.prop_chunk_type_dict = engine.get_chunking_type()
+    
+    # 6. Generate Candidates
+    it_hash = {k: v.copy() for k, v in triple_dict.items()}
+    candi_it_tr, same_itids = engine.generate_candidate(it_hash=it_hash, itid_tr=itid_tr, threshold=min_support)
+    
+    # Set same code
+    same_code_number = 1
+    for tid, iso_trip_lst in same_itids.items():
+        if it_hash[tid].same_code == 0: # 0 is empty for int
+            same_code_str = f"same_{same_code_number}"
+            same_code_id = mapper.get_id(same_code_str)
+            for iso_trip in iso_trip_lst:
+                if it_hash[iso_trip].same_code == 0:
+                    it_hash[iso_trip].set_same_code(same_code_id)
+            same_code_number += 1
+            
+    if len(list(candi_it_tr.keys())) > 0:
+        sampled_candidate = list(candi_it_tr.keys())[0]
+        candidates = same_itids[sampled_candidate]
+        
+        engine.chunking(candidates=candidates, it_hash=it_hash, itid_tr=itid_tr, threshold=min_support)
+        
+        # Post processing results - Map IDs back to Strings for Output
+        subjects = set(v[1] for k, v in engine.Chunking_Result.items())
+        objects = set(v[3] for k, v in engine.Chunking_Result.items())
+        
+        # Check if subject/object is digit (instance ID usually)
+        # In integer mode, they are all ints.
+        # Original logic: instance_as_chunk = [i for i in subjects.union(objects) if i.isdigit()]
+        # "isdigit" check was to distinguish instance IDs (numbers) from Class names?
+        # Or was it to check if it is a Triple ID (which were numbers)?
+        # The Triple IDs are integers. Chunk IDs are like "_1:123".
+        # We need to recover the logic.
+        # "instance_as_chunk" implies we are looking for Triple IDs that act as nodes.
+        # Triple IDs are integers.
+        # Subjects/Objects can be Class IDs, Instance IDs, or Triple IDs (Chunks).
+        
+        # We need to map back to string to check 'isdigit()' logic OR track type.
+        # Triple IDs are stored as strings of digits in original.
+        # Here they are ints.
+        # So we check if the string rep is a digit.
+        
+        instance_as_chunk = []
+        for i in subjects.union(objects):
+            s = mapper.get_str(i)
+            if s.isdigit():
+                instance_as_chunk.append(i)
+        
+        for triple_id, triple_info in engine.Chunking_Result.items():
+            if triple_id in instance_as_chunk:
+                triple_info[5] = '' # Clear flag
+                engine.chunking_result_final[triple_id] = triple_info
+            else:
+                engine.chunking_result_final[triple_id] = triple_info
+        
+        # Convert Final Result to Strings
+        final_result_export = {}
+        for tid, info in engine.chunking_result_final.items():
+            # info: [depth(str), left(id), prop(id), right(id), tr(list), flag]
+            # tid is int.
+            new_info = [
+                info[0],
+                mapper.get_str(info[1]),
+                mapper.get_str(info[2]),
+                mapper.get_str(info[3]),
+                info[4], # tr seems to be transaction ID list? or string?
+                info[5]
+            ]
+            final_result_export[tid] = new_info
+
+        chunk_stack_list = list()
+        for triple_id, triple_info in engine.chunking_result_final.items():
+            if triple_info[5] == '1':
+                engine.chunk_stack.append(engine.ITID_Freq_depth[triple_id][0])
+                engine.chunk_stack.append(itid_tr[triple_id])
+                
+                engine.find_result(triple_id)
+                
+                chunk_stack_list.append(engine.chunk_stack.copy())
+                engine.chunk_stack.clear()
+                
+        # Save Results
+        with open(f'{SUBGRAPHS_FOLDER}/{user_id}_triples_in_subgraphs.pkl', 'wb') as f:
+            pickle.dump(final_result_export, f)
+        with open(f'{SUBGRAPHS_FOLDER}/{user_id}_subgraphs.pkl', 'wb') as f:
+            pickle.dump(chunk_stack_list, f)
+            
+    end_datetime = datetime.now()
+    print(f'User {user_id} - Triple Collection: {(mid_datetime - start_datetime).seconds}s, Subgraph Mining: {(end_datetime - mid_datetime).seconds}s')
+
 
 def run_pipeline(max_users=None):
     # Setup folders
@@ -29,199 +240,54 @@ def run_pipeline(max_users=None):
     # 1. Load Data
     mapped_ml_1m = load_mapped_data()
     metadata_dicts = load_metadata_triples()
+
+    # Pre-process Metadata: Flatten to {movi_key: [all_triples]}
+    # This avoids looping through 13 dicts for every movie in every user loop.
+    print("Flattening metadata for fast lookup...")
+    combined_metadata = defaultdict(list)
+    # Ensure stable order of types
+    for meta_type, meta_dict in metadata_dicts.items():
+        for movi_key, triples in meta_dict.items():
+            combined_metadata[movi_key].extend(triples)
     
-    # 2. Iterate Users
-    movie_log = dict()
-    
-    # Create an engine instance to reuse schema loading
-    engine = FSMEngine()
-    
-    # Load schema once
+    # 2. Schema Loading (Once) with Global Mapper
     print("Loading schema...")
-    engine.property_dict, engine.ontology_graph, class_dict = engine.load_schema(SCHEMA_FILE)
+    global_mapper = StringMapper()
+    engine = FSMEngine(global_mapper)
+    property_dict, ontology_graph, class_dict = engine.load_schema(SCHEMA_FILE)
     
-    # Store clean property dict for re-use (because it gets filtered per user)
-    original_property_dict = copy.deepcopy(engine.property_dict)
-    
-    # Find Ontology Paths (Schema Level) - doing this once
     print("Finding ontology paths...")
-    original_ontology_path_list, original_path_property_set = engine.find_ontology_paths(
-        START_CLASS, END_CLASS_LIST, engine.ontology_graph, MAX_DEPTH
+    ontology_path_list, path_property_set = engine.find_ontology_paths(
+        START_CLASS, END_CLASS_LIST, ontology_graph, MAX_DEPTH
     )
+    
+    # Pack schema data (IDs) to pass to workers
+    # Rename variables to match what process_single_user expects (original_*) or just pass them as tuple
+    schema_data = (property_dict, ontology_graph, ontology_path_list, path_property_set)
+    
+    # Pack Mapper State
+    base_mapper_state = {
+        'str_to_int': global_mapper.str_to_int,
+        'int_to_str': global_mapper.int_to_str,
+        'counter': global_mapper.counter
+    }
 
     print("Starting user processing...")
+    
+    # Prepare User Groups
+    user_groups = []
     for user_id, user_series in mapped_ml_1m.groupby('userId'):
         if max_users is not None and int(user_id) > max_users:
             break
+        user_groups.append((user_id, user_series))
         
-        start_datetime = datetime.now()
-        
-        watched_movie_len = len(user_series)
-        print(f"User: {user_id} | Number of Watching Events: {watched_movie_len}")
-        
-        target_data = user_series.iloc[:-1].copy()
-        one_left = user_series.tail(1)
-        
-        seen_movies = list(one_left['tmdbId'].values)
-        unseen_movie = list(target_data['tmdbId'].values)
-        movie_log[user_id] = (seen_movies, unseen_movie)
-        
-        # --- Triple Generation for User ---
-        total_triples = list()
-        for idx, row in target_data.iterrows():
-            uid = str(int(row['userId']))
-            mid = str(int(row['tmdbId']))
-            rating = row['rating']
-            timestamp = str(int(row['timestamp']))
-            
-            triple1 = ["User", "USER_" + uid, "UserWatching", "WatchingEvent", ''.join(["U", uid, "_M", mid])]
-            # triple2 = ["Movie", "MOVI_" + mid, "MovieRating", "Rating", ''.join(["RATI_", str("%02d" % (rating*10))])]
-            triple3 = ["WatchingEvent", ''.join(["U", uid, "_M", mid]), "WatchingMovie", "Movie", "MOVI_" + mid]
-            
-            total_triples.append(triple1)
-            total_triples.append(triple3)
-            
-            # Metadata augmentation
-            movi_key = "MOVI_" + mid
-            for meta_type, meta_dict in metadata_dicts.items():
-                if movi_key in meta_dict:
-                    total_triples.extend(meta_dict[movi_key])
-                    
-        # Write User Triples to File
-        triple_no = 0
-        triples_to_write = list()
-        for total_triple in total_triples:
-            # Ensure triple has at least 5 elements
-            if len(total_triple) >= 5:
-                instance_triple = f'{triple_no}^{total_triple[0]}^{total_triple[1]}^{total_triple[2]}^{total_triple[3]}^{total_triple[4]}'
-                triples_to_write.append(instance_triple)
-                triple_no += 1
-        
-        instance = pd.Series(triples_to_write)
-        triple_file = f'{TRAINING_FOLDER}/{user_id}.csv'
-        instance.to_csv(triple_file, index=False, header=False)
-        
-        # --- Threshold Calculation ---
-        min_support = 0
-        if watched_movie_len > 100:
-            min_support = 4
-        elif 8 <= watched_movie_len <= 100:
-            min_support = int(math.log(watched_movie_len))
-        elif 3 <= watched_movie_len < 8:
-            min_support = 2
-        else:
-            # pass_case += 1
-            print(f"Skipping User {user_id} (Not enough data)")
-            continue
-            
-        print(f'threshold: {min_support}')
-        mid_datetime = datetime.now()
-        
-        # --- Run FSM for User ---
-        # Reset Engine State for new user
-        engine.ChunkID_Label = {}
-        engine.ITID_Freq_depth = {}
-        engine.depth_chunk = 0
-        engine.Chunking_Result = {}
-        engine.chunking_result_final = {}
-        engine.chunk_stack = []
-        
-        # Restore original schema info
-        engine.property_dict = copy.deepcopy(original_property_dict)
-        engine.ontology_path_list = copy.deepcopy(original_ontology_path_list)
-        engine.path_property_set = copy.deepcopy(original_path_property_set)
-        
-        # 3. Store Triples
-        start_instance_list, triple_dict, prop_triples_dict = engine.store_triples(triple_file, START_CLASS)
-        engine.prop_triples_dict = prop_triples_dict
-        
-        # Filter schema based on available data
-        prop_str_list = [property_info[1] for property_id, property_info in engine.property_dict.items()]
-        triple_dict_temp = copy.deepcopy(triple_dict)
-        for tid, triple in triple_dict_temp.items():
-            if triple.prop not in prop_str_list:
-                triple_dict.pop(tid)
-
-        engine.property_dict = {pid: val for pid, val in engine.property_dict.items() 
-                                if val[1] in prop_triples_dict.keys()}
-        engine.ontology_path_list = [op for op in engine.ontology_path_list 
-                                     if set(op).issubset(set(engine.property_dict.keys()))]
-        engine.path_property_set = engine.path_property_set.intersection(set(engine.property_dict.keys()))
-
-        # 4. Triple Paths
-        triple_paths_dict = {start_instance: engine.find_triple_paths(START_CLASS, start_instance)
-                             for start_instance in start_instance_list}
-        
-        transaction_triple = {start_instance: set(sum(triple_paths, [])) 
-                              for start_instance, triple_paths in triple_paths_dict.items()}
-        
-        it_trs = defaultdict(set)
-        for start_instance, triple_set in transaction_triple.items():
-            for tid in triple_set:
-                it_trs[tid].add(start_instance)
-                
-        # Filter triple_dict
-        triple_dict_keys = list(triple_dict.keys())
-        for tid in triple_dict_keys:
-            if tid not in it_trs:
-                triple_dict.pop(tid)
-                
-        itid_tr = {tid: list(start_instance)[0] for tid, start_instance in it_trs.items()}
-        
-        # 5. Chunk Type
-        engine.prop_chunk_type_dict = engine.get_chunking_type()
-        
-        # 6. Generate Candidates
-        it_hash = copy.deepcopy(triple_dict)
-        candi_it_tr, same_itids = engine.generate_candidate(it_hash=it_hash, itid_tr=itid_tr, threshold=min_support)
-        
-        # Set same code
-        same_code_number = 1
-        for tid, iso_trip_lst in same_itids.items():
-            if it_hash[tid].same_code == '':
-                same_code = f"same_{same_code_number}"
-                for iso_trip in iso_trip_lst:
-                    if it_hash[iso_trip].same_code == '':
-                        it_hash[iso_trip].set_same_code(same_code)
-                same_code_number += 1
-                
-        if len(list(candi_it_tr.keys())) > 0:
-            sampled_candidate = list(candi_it_tr.keys())[0]
-            candidates = same_itids[sampled_candidate]
-            
-            engine.chunking(candidates=candidates, it_hash=it_hash, itid_tr=itid_tr, threshold=min_support)
-            
-            # Post processing results
-            subjects = set(v[1] for k, v in engine.Chunking_Result.items())
-            objects = set(v[3] for k, v in engine.Chunking_Result.items())
-            instance_as_chunk = [i for i in subjects.union(objects) if i.isdigit()]
-            
-            for triple_id, triple_info in engine.Chunking_Result.items():
-                if triple_id in instance_as_chunk:
-                    triple_info[5] = ''
-                    engine.chunking_result_final[triple_id] = triple_info
-                else:
-                    engine.chunking_result_final[triple_id] = triple_info
-                    
-            chunk_stack_list = list()
-            for triple_id, triple_info in engine.chunking_result_final.items():
-                if triple_info[5] == '1':
-                    engine.chunk_stack.append(engine.ITID_Freq_depth[triple_id][0])
-                    engine.chunk_stack.append(itid_tr[triple_id])
-                    
-                    engine.find_result(triple_id)
-                    
-                    chunk_stack_list.append(engine.chunk_stack.copy())
-                    engine.chunk_stack.clear()
-                    
-            # Save Results
-            with open(f'{SUBGRAPHS_FOLDER}/{user_id}_triples_in_subgraphs.pkl', 'wb') as f:
-                pickle.dump(engine.chunking_result_final, f)
-            with open(f'{SUBGRAPHS_FOLDER}/{user_id}_subgraphs.pkl', 'wb') as f:
-                pickle.dump(chunk_stack_list, f)
-                
-        end_datetime = datetime.now()
-        print('Triple Collection (sec):', (mid_datetime - start_datetime).seconds)
-        print('Subgraph Mining (sec):', (end_datetime - mid_datetime).seconds)
-        print('---------------------------------------')
-
+    # Parallel Execution
+    n_jobs = max(1, cpu_count() - 1)
+    print(f"Running on {n_jobs} cores...")
+    
+    Parallel(n_jobs=n_jobs)(
+        delayed(process_single_user)(user_group, schema_data, combined_metadata, base_mapper_state) 
+        for user_group in user_groups
+    )
+    
+    print("Pipeline completed.")
