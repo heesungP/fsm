@@ -65,7 +65,7 @@ def process_single_user(user_data, schema_data, combined_metadata, base_mapper_s
         
         # Triple 3: WatchingEvent -> Movie
         total_triples.append((0, "WatchingEvent", event_node, "WatchingMovie", "Movie", movie_node))
-
+    
     # Metadata Logic (Optimized)
     for uid, mid in zip(uids, mids):
         movi_key = "MOVI_" + mid
@@ -87,28 +87,19 @@ def process_single_user(user_data, schema_data, combined_metadata, base_mapper_s
     # --- Run FSM for User ---
     engine = FSMEngine(mapper)
     
-    # Restore schema info (These contain IDs now because base_mapper_state was used in main)
-    # Need to be careful: original_property_dict keys/values must be IDs.
-    # The main process loaded schema using a mapper, so these are already IDs.
+    # Restore schema info
     engine.property_dict = copy.deepcopy(original_property_dict)
+    engine.ontology_graph = original_ontology_graph 
     engine.ontology_path_list = copy.deepcopy(original_ontology_path_list)
     engine.path_property_set = copy.deepcopy(original_path_property_set)
-    # ontology_graph is not modified, can use reference? dict is mutable, safe to copy?
-    # engine.ontology_graph is modified in load_schema but not in mining?
-    # find_ontology_paths doesn't modify graph.
-    engine.ontology_graph = original_ontology_graph # Pass as is if read-only
 
     # 3. Store Triples (Strings -> IDs inside)
     start_instance_list, triple_dict, prop_triples_dict = engine.store_triples(triples_for_engine, START_CLASS)
     engine.prop_triples_dict = prop_triples_dict
 
     # Filter schema based on available data (IDs)
-    # prop_triples_dict keys are IDs.
-    # engine.property_dict values are [dom_id, prop_id, ran_id].
-    
     prop_id_list = [property_info[1] for property_id, property_info in engine.property_dict.items()]
     
-    # triple_dict keys are IDs. triple values have .prop (ID).
     triple_dict = {tid: t for tid, t in triple_dict.items() if t.prop in prop_id_list}
 
     engine.property_dict = {pid: val for pid, val in engine.property_dict.items() 
@@ -144,7 +135,7 @@ def process_single_user(user_data, schema_data, combined_metadata, base_mapper_s
     # Set same code
     same_code_number = 1
     for tid, iso_trip_lst in same_itids.items():
-        if it_hash[tid].same_code == 0: # 0 is empty for int
+        if it_hash[tid].same_code == 0: 
             same_code_str = f"same_{same_code_number}"
             same_code_id = mapper.get_id(same_code_str)
             for iso_trip in iso_trip_lst:
@@ -158,25 +149,9 @@ def process_single_user(user_data, schema_data, combined_metadata, base_mapper_s
         
         engine.chunking(candidates=candidates, it_hash=it_hash, itid_tr=itid_tr, threshold=min_support)
         
-        # Post processing results - Map IDs back to Strings for Output
+        # Post processing results
         subjects = set(v[1] for k, v in engine.Chunking_Result.items())
         objects = set(v[3] for k, v in engine.Chunking_Result.items())
-        
-        # Check if subject/object is digit (instance ID usually)
-        # In integer mode, they are all ints.
-        # Original logic: instance_as_chunk = [i for i in subjects.union(objects) if i.isdigit()]
-        # "isdigit" check was to distinguish instance IDs (numbers) from Class names?
-        # Or was it to check if it is a Triple ID (which were numbers)?
-        # The Triple IDs are integers. Chunk IDs are like "_1:123".
-        # We need to recover the logic.
-        # "instance_as_chunk" implies we are looking for Triple IDs that act as nodes.
-        # Triple IDs are integers.
-        # Subjects/Objects can be Class IDs, Instance IDs, or Triple IDs (Chunks).
-        
-        # We need to map back to string to check 'isdigit()' logic OR track type.
-        # Triple IDs are stored as strings of digits in original.
-        # Here they are ints.
-        # So we check if the string rep is a digit.
         
         instance_as_chunk = []
         for i in subjects.union(objects):
@@ -186,7 +161,7 @@ def process_single_user(user_data, schema_data, combined_metadata, base_mapper_s
         
         for triple_id, triple_info in engine.Chunking_Result.items():
             if triple_id in instance_as_chunk:
-                triple_info[5] = '' # Clear flag
+                triple_info[5] = '' 
                 engine.chunking_result_final[triple_id] = triple_info
             else:
                 engine.chunking_result_final[triple_id] = triple_info
@@ -194,14 +169,12 @@ def process_single_user(user_data, schema_data, combined_metadata, base_mapper_s
         # Convert Final Result to Strings
         final_result_export = {}
         for tid, info in engine.chunking_result_final.items():
-            # info: [depth(str), left(id), prop(id), right(id), tr(list), flag]
-            # tid is int.
             new_info = [
                 info[0],
                 mapper.get_str(info[1]),
                 mapper.get_str(info[2]),
                 mapper.get_str(info[3]),
-                info[4], # tr seems to be transaction ID list? or string?
+                info[4], 
                 info[5]
             ]
             final_result_export[tid] = new_info
@@ -242,7 +215,6 @@ def run_pipeline(max_users=None):
     metadata_dicts = load_metadata_triples()
 
     # Pre-process Metadata: Flatten to {movi_key: [all_triples]}
-    # This avoids looping through 13 dicts for every movie in every user loop.
     print("Flattening metadata for fast lookup...")
     combined_metadata = defaultdict(list)
     # Ensure stable order of types
@@ -262,7 +234,6 @@ def run_pipeline(max_users=None):
     )
     
     # Pack schema data (IDs) to pass to workers
-    # Rename variables to match what process_single_user expects (original_*) or just pass them as tuple
     schema_data = (property_dict, ontology_graph, ontology_path_list, path_property_set)
     
     # Pack Mapper State

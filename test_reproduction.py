@@ -9,7 +9,7 @@ def test_reproduction():
     print("Running pipeline for first 5 users...")
     
     try:
-        run_pipeline(max_users=100)
+        run_pipeline(max_users=5)
     except Exception as e:
         print(f"Pipeline failed: {e}")
         return
