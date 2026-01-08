@@ -16,11 +16,18 @@ from .config import (
 from .utils import log_data
 from .fsm import FSMEngine
 from .data_loader import load_mapped_data, load_metadata_triples
+from .mapper import StringMapper
 
-def process_single_user(user_data, schema_data, metadata_dicts):
+def process_single_user(user_data, schema_data, combined_metadata, base_mapper_state):
     user_id, user_series = user_data
     original_property_dict, original_ontology_graph, original_ontology_path_list, original_path_property_set = schema_data
     
+    # Initialize Mapper with Base State (Schema)
+    mapper = StringMapper()
+    mapper.str_to_int = base_mapper_state['str_to_int'].copy()
+    mapper.int_to_str = base_mapper_state['int_to_str'].copy()
+    mapper.counter = base_mapper_state['counter']
+
     start_datetime = datetime.now()
     watched_movie_len = len(user_series)
     print(f"User: {user_id} | Number of Watching Events: {watched_movie_len}")
@@ -47,7 +54,6 @@ def process_single_user(user_data, schema_data, metadata_dicts):
     # Vectorized preparation
     uids = target_data['userId'].astype(int).astype(str).tolist()
     mids = target_data['tmdbId'].astype(int).astype(str).tolist()
-    # ratings = target_data['rating'].tolist() # Not used in triple generation logic provided
     
     for uid, mid in zip(uids, mids):
         user_node = "USER_" + uid
@@ -59,53 +65,19 @@ def process_single_user(user_data, schema_data, metadata_dicts):
         
         # Triple 3: WatchingEvent -> Movie
         total_triples.append((0, "WatchingEvent", event_node, "WatchingMovie", "Movie", movie_node))
-        
-        # Metadata augmentation
-        if movie_node in metadata_dicts: # metadata_dicts is flattened? No, it's dict of dicts.
-             # Wait, metadata_dicts in original code was: 
-             # for meta_type, meta_dict in metadata_dicts.items():
-             #    if movi_key in meta_dict: total_triples.extend(...)
-             # We should optimize this.
-             pass
-
-    # Re-implement metadata logic efficiently
-    # To ensure identical triple ID generation as the original code, we must iterate 
-    # metadata_dicts in the exact same order. The original code used:
-    # for meta_type, meta_dict in metadata_dicts.items():
-    #
-    # Since metadata_dicts is loaded from files, the insertion order into the dict 
-    # determines the iteration order in Python 3.7+.
-    # However, to be absolutely safe and consistent across runs/processes, 
-    # we should rely on the original iteration order or sorted keys if appropriate.
-    # The original code didn't sort, so it relied on insertion order.
-    # We will use the same iteration logic.
     
-    # Pre-fetch metadata keys to ensure stable order if needed, but original code just did .items()
-    # metadata_dicts is passed as an argument.
-    
+    # Metadata Logic (Optimized)
     for uid, mid in zip(uids, mids):
         movi_key = "MOVI_" + mid
-        
-        # Original logic:
-        # for meta_type, meta_dict in metadata_dicts.items():
-        #     if movi_key in meta_dict:
-        #         total_triples.extend(meta_dict[movi_key])
-        
-        for meta_type, meta_dict in metadata_dicts.items():
-            if movi_key in meta_dict:
-                 total_triples.extend(meta_dict[movi_key])
+        if movi_key in combined_metadata:
+            total_triples.extend(combined_metadata[movi_key])
 
     # Assign Triple IDs and Format for Engine
     triples_for_engine = []
     triple_no = 0
     for t in total_triples:
-        # Check logic to match original behavior exactly:
-        # Original: instance_triple = f'{triple_no}^{total_triple[0]}^{total_triple[1]}^{total_triple[2]}^{total_triple[3]}^{total_triple[4]}'
-        # It always takes the first 5 elements regardless of length.
-        
         if len(t) >= 5:
-            # Construct row for store_triples: [id, subj_cl, subj_inst, prop, obj_cl, obj_inst]
-            # Use t[0]~t[4] to ensure identical behavior with original code
+            # Row: [id, subj_cl, subj_inst, prop, obj_cl, obj_inst] (All Strings)
             row = [str(triple_no), t[0], t[1], t[2], t[3], t[4]]
             triples_for_engine.append(row)
             triple_no += 1
@@ -113,23 +85,22 @@ def process_single_user(user_data, schema_data, metadata_dicts):
     mid_datetime = datetime.now()
 
     # --- Run FSM for User ---
-    engine = FSMEngine()
+    engine = FSMEngine(mapper)
     
     # Restore schema info
     engine.property_dict = copy.deepcopy(original_property_dict)
-    engine.ontology_graph = original_ontology_graph # Graph is not modified usually
+    engine.ontology_graph = original_ontology_graph 
     engine.ontology_path_list = copy.deepcopy(original_ontology_path_list)
     engine.path_property_set = copy.deepcopy(original_path_property_set)
 
-    # 3. Store Triples (Memory-based)
+    # 3. Store Triples (Strings -> IDs inside)
     start_instance_list, triple_dict, prop_triples_dict = engine.store_triples(triples_for_engine, START_CLASS)
     engine.prop_triples_dict = prop_triples_dict
 
-    # Filter schema based on available data
-    prop_str_list = [property_info[1] for property_id, property_info in engine.property_dict.items()]
+    # Filter schema based on available data (IDs)
+    prop_id_list = [property_info[1] for property_id, property_info in engine.property_dict.items()]
     
-    # Use dict comprehension for filtering (faster than pop in loop)
-    triple_dict = {tid: t for tid, t in triple_dict.items() if t.prop in prop_str_list}
+    triple_dict = {tid: t for tid, t in triple_dict.items() if t.prop in prop_id_list}
 
     engine.property_dict = {pid: val for pid, val in engine.property_dict.items() 
                             if val[1] in prop_triples_dict.keys()}
@@ -158,17 +129,18 @@ def process_single_user(user_data, schema_data, metadata_dicts):
     engine.prop_chunk_type_dict = engine.get_chunking_type()
     
     # 6. Generate Candidates
-    it_hash = {k: v.copy() for k, v in triple_dict.items()} # Shallow copy of dict, copy of objects
+    it_hash = {k: v.copy() for k, v in triple_dict.items()}
     candi_it_tr, same_itids = engine.generate_candidate(it_hash=it_hash, itid_tr=itid_tr, threshold=min_support)
     
     # Set same code
     same_code_number = 1
     for tid, iso_trip_lst in same_itids.items():
-        if it_hash[tid].same_code == '':
-            same_code = f"same_{same_code_number}"
+        if it_hash[tid].same_code == 0: 
+            same_code_str = f"same_{same_code_number}"
+            same_code_id = mapper.get_id(same_code_str)
             for iso_trip in iso_trip_lst:
-                if it_hash[iso_trip].same_code == '':
-                    it_hash[iso_trip].set_same_code(same_code)
+                if it_hash[iso_trip].same_code == 0:
+                    it_hash[iso_trip].set_same_code(same_code_id)
             same_code_number += 1
             
     if len(list(candi_it_tr.keys())) > 0:
@@ -180,15 +152,33 @@ def process_single_user(user_data, schema_data, metadata_dicts):
         # Post processing results
         subjects = set(v[1] for k, v in engine.Chunking_Result.items())
         objects = set(v[3] for k, v in engine.Chunking_Result.items())
-        instance_as_chunk = [i for i in subjects.union(objects) if i.isdigit()]
+        
+        instance_as_chunk = []
+        for i in subjects.union(objects):
+            s = mapper.get_str(i)
+            if s.isdigit():
+                instance_as_chunk.append(i)
         
         for triple_id, triple_info in engine.Chunking_Result.items():
             if triple_id in instance_as_chunk:
-                triple_info[5] = ''
+                triple_info[5] = '' 
                 engine.chunking_result_final[triple_id] = triple_info
             else:
                 engine.chunking_result_final[triple_id] = triple_info
-                
+        
+        # Convert Final Result to Strings
+        final_result_export = {}
+        for tid, info in engine.chunking_result_final.items():
+            new_info = [
+                info[0],
+                mapper.get_str(info[1]),
+                mapper.get_str(info[2]),
+                mapper.get_str(info[3]),
+                info[4], 
+                info[5]
+            ]
+            final_result_export[tid] = new_info
+
         chunk_stack_list = list()
         for triple_id, triple_info in engine.chunking_result_final.items():
             if triple_info[5] == '1':
@@ -202,7 +192,7 @@ def process_single_user(user_data, schema_data, metadata_dicts):
                 
         # Save Results
         with open(f'{SUBGRAPHS_FOLDER}/{user_id}_triples_in_subgraphs.pkl', 'wb') as f:
-            pickle.dump(engine.chunking_result_final, f)
+            pickle.dump(final_result_export, f)
         with open(f'{SUBGRAPHS_FOLDER}/{user_id}_subgraphs.pkl', 'wb') as f:
             pickle.dump(chunk_stack_list, f)
             
@@ -223,10 +213,19 @@ def run_pipeline(max_users=None):
     # 1. Load Data
     mapped_ml_1m = load_mapped_data()
     metadata_dicts = load_metadata_triples()
+
+    # Pre-process Metadata: Flatten to {movi_key: [all_triples]}
+    print("Flattening metadata for fast lookup...")
+    combined_metadata = defaultdict(list)
+    # Ensure stable order of types
+    for meta_type, meta_dict in metadata_dicts.items():
+        for movi_key, triples in meta_dict.items():
+            combined_metadata[movi_key].extend(triples)
     
-    # 2. Schema Loading (Once)
+    # 2. Schema Loading (Once) with Global Mapper
     print("Loading schema...")
-    engine = FSMEngine()
+    global_mapper = StringMapper()
+    engine = FSMEngine(global_mapper)
     property_dict, ontology_graph, class_dict = engine.load_schema(SCHEMA_FILE)
     
     print("Finding ontology paths...")
@@ -234,8 +233,15 @@ def run_pipeline(max_users=None):
         START_CLASS, END_CLASS_LIST, ontology_graph, MAX_DEPTH
     )
     
-    # Pack schema data to pass to workers
+    # Pack schema data (IDs) to pass to workers
     schema_data = (property_dict, ontology_graph, ontology_path_list, path_property_set)
+    
+    # Pack Mapper State
+    base_mapper_state = {
+        'str_to_int': global_mapper.str_to_int,
+        'int_to_str': global_mapper.int_to_str,
+        'counter': global_mapper.counter
+    }
 
     print("Starting user processing...")
     
@@ -247,11 +253,11 @@ def run_pipeline(max_users=None):
         user_groups.append((user_id, user_series))
         
     # Parallel Execution
-    n_jobs = max(1, cpu_count() - 1) # Ensure at least 1 job, leave 1 core free
+    n_jobs = max(1, cpu_count() - 1)
     print(f"Running on {n_jobs} cores...")
     
     Parallel(n_jobs=n_jobs)(
-        delayed(process_single_user)(user_group, schema_data, metadata_dicts) 
+        delayed(process_single_user)(user_group, schema_data, combined_metadata, base_mapper_state) 
         for user_group in user_groups
     )
     
