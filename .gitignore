@@ -1,0 +1,9 @@
+input/
+metadata/
+original data from kaggle/
+subgraphs/
+training_1m/
+venv/
+fsm_run.log
+requirements.txt
+
